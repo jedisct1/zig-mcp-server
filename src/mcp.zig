@@ -1,0 +1,382 @@
+const std = @import("std");
+const jsonrpc = @import("jsonrpc.zig");
+const net = @import("net.zig");
+
+/// MCP Protocol Constants
+pub const PROTOCOL_VERSION = "0.4.0";
+
+/// Tool handler function type
+/// Now uses context instead of allocator for memory management
+pub const ToolHandlerFn = *const fn (ctx: *jsonrpc.Context, params: std.json.Value) anyerror!std.json.Value;
+
+/// MCP Tool definition
+pub const Tool = struct {
+    /// Tool name - stored in static memory
+    name: []const u8,
+    /// Tool description - stored in static memory
+    description: []const u8,
+    /// Tool handler function
+    handler: ToolHandlerFn,
+    /// Optional parameters schema (JSON Schema) - should be stored in static memory
+    parameters: ?std.json.Value = null,
+};
+
+/// Transport type
+pub const TransportType = enum {
+    stdio,
+    http,
+};
+
+/// MCP Server settings
+pub const Settings = struct {
+    /// Transport type
+    transport: TransportType = .stdio,
+    /// Host for HTTP transport - stored in static memory
+    host: []const u8 = "127.0.0.1",
+    /// Port for HTTP transport
+    port: u16 = 7777,
+    /// Array of tools - stored in static memory
+    tools: []const Tool = &[_]Tool{},
+};
+
+/// MCP Server state
+pub const ServerState = enum {
+    created,
+    initializing,
+    ready,
+    error_state,
+    shutdown,
+};
+
+/// MCP Server implementation
+pub const Server = struct {
+    /// Parent allocator for general allocations
+    parent_allocator: std.mem.Allocator,
+    /// Server settings
+    settings: Settings,
+    /// Current server state
+    state: ServerState,
+    /// Map of registered tools
+    tools: std.StringHashMap(Tool),
+    /// HTTP server (if using HTTP transport)
+    http_server: ?net.HttpServer,
+    /// A context arena for the current request-response cycle
+    request_context: jsonrpc.Context,
+
+    pub fn init(allocator: std.mem.Allocator, settings: Settings) !Server {
+        var tools = std.StringHashMap(Tool).init(allocator);
+
+        // Register all tools
+        for (settings.tools) |tool| {
+            try tools.put(tool.name, tool);
+        }
+
+        return Server{
+            .parent_allocator = allocator,
+            .settings = settings,
+            .state = .created,
+            .tools = tools,
+            .http_server = null,
+            .request_context = jsonrpc.Context.init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Server) void {
+        self.tools.deinit();
+        self.request_context.deinit();
+        if (self.http_server) |*http_server| {
+            http_server.deinit();
+        }
+    }
+
+    pub fn start(self: *Server) !void {
+        switch (self.settings.transport) {
+            .stdio => try self.startStdioTransport(),
+            .http => try self.startHttpTransport(),
+        }
+    }
+
+    fn startStdioTransport(self: *Server) !void {
+        const stdin = std.io.getStdIn().reader();
+        const stdout = std.io.getStdOut().writer();
+
+        self.state = .ready;
+
+        while (self.state != .shutdown) {
+            var buffer: [4096]u8 = undefined;
+            const bytes_read = try stdin.read(&buffer);
+            if (bytes_read == 0) {
+                // EOF, exit
+                break;
+            }
+
+            const message = buffer[0..bytes_read];
+            const response = try self.handleRequest(message);
+            if (response.len > 0) {
+                try stdout.writeAll(response);
+                try stdout.writeAll("\n");
+            }
+
+            // Reset the request context for the next iteration
+            self.request_context.reset();
+        }
+    }
+
+    fn startHttpTransport(self: *Server) !void {
+        var http_server = try net.HttpServer.init(self.parent_allocator, self.settings.host, self.settings.port);
+        self.http_server = http_server;
+        self.state = .ready;
+
+        // Store server instance for the HTTP handler
+        g_server = self;
+
+        try http_server.listen(handleHttpConnection);
+    }
+
+    fn handleHttpConnection(conn: *net.Connection) !void {
+        defer conn.deinit();
+
+        var request = try conn.parseRequest();
+        defer request.deinit();
+
+        // Only handle POST requests to /jsonrpc
+        if (!std.mem.eql(u8, request.method, "POST") or !std.mem.eql(u8, request.path, "/jsonrpc")) {
+            try conn.sendResponse(404, "text/plain", "Not Found");
+            return;
+        }
+
+        // Get server instance from the global pointer
+        const server = g_server;
+
+        // Process the JSON-RPC request
+        const response = try server.handleRequest(request.body);
+
+        // Send the response
+        try conn.sendResponse(200, "application/json", response);
+
+        // Reset the request context for the next request
+        server.request_context.reset();
+    }
+
+    // Global server pointer for the HTTP handler
+    // This is a simplification for this example
+    var g_server: *Server = undefined;
+
+    pub fn handleRequest(self: *Server, request_str: []const u8) ![]const u8 {
+        // Parse the JSON-RPC request
+        const request = jsonrpc.parseMessage(&self.request_context, request_str) catch |err| {
+            std.debug.print("Error parsing request: {}\n", .{err});
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, std.json.Value{ .null = {} }, .parseError, "Parse error");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        };
+
+        // Validate the JSON-RPC request
+        jsonrpc.validateMessage(request) catch |err| {
+            std.debug.print("Invalid request: {}\n", .{err});
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .invalidRequest, "Invalid Request");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        };
+
+        // Extract method and params
+        const method = request.object.get("method") orelse {
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .invalidRequest, "Method not specified");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        };
+
+        if (method != .string) {
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .invalidRequest, "Method must be a string");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        }
+
+        const params = request.object.get("params") orelse std.json.Value{ .object = std.json.ObjectMap.init(self.request_context.allocator()) };
+
+        // Check if this is an initialization request
+        if (std.mem.eql(u8, method.string, "initialize")) {
+            return try self.handleInitialize(request);
+        }
+
+        // Check if server is initialized
+        if (self.state != .ready) {
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .serverNotInitialized, "Server not initialized");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        }
+
+        // Handle initialized notification
+        if (std.mem.eql(u8, method.string, "initialized")) {
+            // Just acknowledge, no response needed for notifications
+            return &[_]u8{};
+        }
+
+        // Handle shutdown request
+        if (std.mem.eql(u8, method.string, "shutdown")) {
+            self.state = .shutdown;
+            const response = try jsonrpc.createSuccessResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, std.json.Value{ .null = {} });
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), response);
+        }
+
+        // Parse mcp/tools/invoke methods
+        if (std.mem.startsWith(u8, method.string, "mcp/tools/")) {
+            const tool_method = method.string["mcp/tools/".len..];
+
+            if (std.mem.eql(u8, tool_method, "list")) {
+                return try self.handleToolsList(request);
+            } else if (std.mem.eql(u8, tool_method, "invoke")) {
+                return try self.handleToolInvoke(request, params);
+            }
+        }
+
+        // Method not found
+        const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .methodNotFound, "Method not found");
+        return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+    }
+
+    fn handleInitialize(self: *Server, request: std.json.Value) ![]const u8 {
+        self.state = .initializing;
+
+        // Extract client capabilities from params
+        const params = request.object.get("params") orelse {
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .invalidParams, "Params missing in initialize request");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        };
+
+        // Check protocol version (optional)
+        if (params.object.get("protocolVersion")) |version| {
+            if (version != .string or !std.mem.eql(u8, version.string, PROTOCOL_VERSION)) {
+                const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .unknownProtocolVersion, "Unsupported protocol version");
+                return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+            }
+        }
+
+        // Create server capabilities
+        var capabilities = std.json.Value{ .object = std.json.ObjectMap.init(self.request_context.allocator()) };
+        try capabilities.object.put("protocolVersion", std.json.Value{ .string = try self.request_context.allocator().dupe(u8, PROTOCOL_VERSION) });
+
+        // Add tools capability
+        var tools_capability = std.json.Value{ .object = std.json.ObjectMap.init(self.request_context.allocator()) };
+        try tools_capability.object.put("enabled", std.json.Value{ .bool = true });
+        try capabilities.object.put("tools", tools_capability);
+
+        // Create response
+        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.request_context.allocator()) };
+        try result.object.put("capabilities", capabilities);
+        try result.object.put("serverInfo", try createServerInfo(&self.request_context));
+
+        const response = try jsonrpc.createSuccessResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, result);
+
+        self.state = .ready;
+        return try jsonrpc.stringifyValue(self.request_context.allocator(), response);
+    }
+
+    fn handleToolsList(self: *Server, request: std.json.Value) ![]const u8 {
+        var tools_array = std.json.Value{ .array = std.json.Array.init(self.request_context.allocator()) };
+
+        var tools_iter = self.tools.iterator();
+        while (tools_iter.next()) |tool_entry| {
+            const tool = tool_entry.value_ptr.*;
+            var tool_obj = std.json.Value{ .object = std.json.ObjectMap.init(self.request_context.allocator()) };
+
+            try tool_obj.object.put("name", std.json.Value{ .string = try self.request_context.allocator().dupe(u8, tool.name) });
+            try tool_obj.object.put("description", std.json.Value{ .string = try self.request_context.allocator().dupe(u8, tool.description) });
+
+            if (tool.parameters) |params| {
+                // If parameters schema is provided, we need to clone it
+                // into our arena allocator since it's in static memory
+                const cloned = try cloneJsonValue(self.request_context.allocator(), params);
+                try tool_obj.object.put("parameters", cloned);
+            }
+
+            try tools_array.array.append(tool_obj);
+        }
+
+        var result = std.json.Value{ .object = std.json.ObjectMap.init(self.request_context.allocator()) };
+        try result.object.put("tools", tools_array);
+
+        const response = try jsonrpc.createSuccessResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, result);
+
+        return try jsonrpc.stringifyValue(self.request_context.allocator(), response);
+    }
+
+    fn handleToolInvoke(self: *Server, request: std.json.Value, params: std.json.Value) ![]const u8 {
+        if (params != .object) {
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .invalidParams, "Params must be an object");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        }
+
+        // Extract tool name and params
+        const name_value = params.object.get("name") orelse {
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .invalidParams, "Tool name missing");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        };
+
+        if (name_value != .string) {
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .invalidParams, "Tool name must be a string");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        }
+
+        const tool_params = params.object.get("params") orelse std.json.Value{ .object = std.json.ObjectMap.init(self.request_context.allocator()) };
+
+        // Find the tool
+        const tool = self.tools.get(name_value.string) orelse {
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .methodNotFound, "Tool not found");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        };
+
+        // Invoke the tool handler
+        const result = tool.handler(&self.request_context, tool_params) catch |err| {
+            std.debug.print("Error invoking tool: {}\n", .{err});
+            const error_response = try jsonrpc.createErrorResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, .requestFailed, "Tool execution failed");
+            return try jsonrpc.stringifyValue(self.request_context.allocator(), error_response);
+        };
+
+        const response = try jsonrpc.createSuccessResponse(&self.request_context, request.object.get("id") orelse std.json.Value{ .null = {} }, result);
+
+        return try jsonrpc.stringifyValue(self.request_context.allocator(), response);
+    }
+};
+
+/// Create server info object
+fn createServerInfo(ctx: *jsonrpc.Context) !std.json.Value {
+    const allocator = ctx.allocator();
+
+    var server_info = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    try server_info.object.put("name", std.json.Value{ .string = try allocator.dupe(u8, "zig-mcp") });
+    try server_info.object.put("version", std.json.Value{ .string = try allocator.dupe(u8, "0.1.0") });
+    return server_info;
+}
+
+/// Clone a JSON value using the given allocator
+pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .null, .bool, .integer, .float => value,
+        .number_string => |s| std.json.Value{ .number_string = try allocator.dupe(u8, s) },
+        .string => |s| std.json.Value{ .string = try allocator.dupe(u8, s) },
+        .array => |a| blk: {
+            var new_array = std.json.Array.init(allocator);
+            errdefer new_array.deinit();
+
+            try new_array.ensureTotalCapacity(a.items.len);
+            for (a.items) |item| {
+                try new_array.append(try cloneJsonValue(allocator, item));
+            }
+
+            break :blk std.json.Value{ .array = new_array };
+        },
+        .object => |o| blk: {
+            var new_object = std.json.ObjectMap.init(allocator);
+            errdefer {
+                var iter = new_object.iterator();
+                while (iter.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                }
+                new_object.deinit();
+            }
+
+            var iter = o.iterator();
+            while (iter.next()) |entry| {
+                try new_object.put(try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
+            }
+
+            break :blk std.json.Value{ .object = new_object };
+        },
+    };
+}

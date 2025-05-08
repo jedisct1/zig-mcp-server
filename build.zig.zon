@@ -1,0 +1,15 @@
+.{
+    .name = .mcp_server,
+    .version = "0.1.0",
+    .fingerprint = 0x301f264c5d9299eb,
+    .dependencies = .{
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+        "Makefile",
+    },
+}
