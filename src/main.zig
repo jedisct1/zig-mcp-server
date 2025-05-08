@@ -40,6 +40,11 @@ pub fn main() !void {
         .host = "127.0.0.1",
         .transport = .stdio,
         .tools = &tools,
+        .max_connections = 1000, // Default to 1000 max connections
+        .thread_count = null, // Default to auto-detect (based on CPU cores)
+        .connection_timeout_ms = 30000, // Default to 30 seconds timeout
+        .backlog_size = 128, // Default to 128 connections backlog
+        .non_blocking_http = false, // Default to blocking HTTP server
     };
 
     // Parse command line arguments using stack-allocated buffer
@@ -69,6 +74,24 @@ pub fn main() !void {
                     std.debug.print("Unknown transport: {s}. Using default.\n", .{transport});
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--threads") or std.mem.eql(u8, arg, "-j")) {
+            if (args_it.next()) |threads_str| {
+                settings.thread_count = try std.fmt.parseInt(usize, threads_str, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--max-connections") or std.mem.eql(u8, arg, "-c")) {
+            if (args_it.next()) |conn_str| {
+                settings.max_connections = try std.fmt.parseInt(usize, conn_str, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--timeout") or std.mem.eql(u8, arg, "-T")) {
+            if (args_it.next()) |timeout_str| {
+                settings.connection_timeout_ms = try std.fmt.parseInt(u32, timeout_str, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--backlog") or std.mem.eql(u8, arg, "-b")) {
+            if (args_it.next()) |backlog_str| {
+                settings.backlog_size = try std.fmt.parseInt(u32, backlog_str, 10);
+            }
+        } else if (std.mem.eql(u8, arg, "--non-blocking")) {
+            settings.non_blocking_http = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
             printHelp();
             return;
@@ -81,7 +104,26 @@ pub fn main() !void {
 
     std.debug.print("MCP Server starting with transport: {s}\n", .{@tagName(settings.transport)});
     if (settings.transport == .http) {
-        std.debug.print("Listening on http://{s}:{d}\n", .{ settings.host, settings.port });
+        const thread_count_str = if (settings.thread_count) |tc|
+            std.fmt.allocPrint(allocator, "{d}", .{tc}) catch "(error)"
+        else
+            "(auto)";
+
+        const max_connections = settings.max_connections orelse 1000;
+        const timeout_str = if (settings.connection_timeout_ms == 0)
+            "disabled"
+        else
+            std.fmt.allocPrint(allocator, "{d}ms", .{settings.connection_timeout_ms}) catch "?";
+
+        defer {
+            if (settings.thread_count != null and !std.mem.eql(u8, thread_count_str, "(error)"))
+                allocator.free(@as([]u8, @constCast(thread_count_str)));
+
+            if (settings.connection_timeout_ms != 0 and !std.mem.eql(u8, timeout_str, "?"))
+                allocator.free(@as([]u8, @constCast(timeout_str)));
+        }
+
+        std.debug.print("Listening on http://{s}:{d} with {s} threads, {d} max connections, timeout: {s}\n", .{ settings.host, settings.port, thread_count_str, max_connections, timeout_str });
     }
 
     try server.start();
@@ -93,10 +135,19 @@ fn printHelp() void {
         \\Usage: zig-mcp [options]
         \\
         \\Options:
-        \\  --port, -p <port>           Port to listen on (default: 7777)
-        \\  --host, -h <host>           Host to bind to (default: 127.0.0.1)
-        \\  --transport, -t <transport> Transport to use (stdio, http) (default: stdio)
-        \\  --help                      Print this help message
+        \\  --port, -p <port>                  Port to listen on (default: 7777)
+        \\  --host, -h <host>                  Host to bind to (default: 127.0.0.1)
+        \\  --transport, -t <transport>        Transport to use (stdio, http) (default: stdio)
+        \\  --threads, -j <count>              Number of worker threads (default: CPU core count)
+        \\  --max-connections, -c <count>      Maximum concurrent connections (default: 1000)
+        \\  --timeout, -T <milliseconds>       Connection timeout in milliseconds (default: 30000, 0 = no timeout)
+        \\  --backlog, -b <count>              TCP connection backlog size (default: 128)
+        \\  --non-blocking                     Run HTTP server in non-blocking mode
+        \\  --help                             Print this help message
+        \\
+        \\Server Endpoints:
+        \\  /jsonrpc                           Main JSON-RPC endpoint (POST)
+        \\  /health                            Health check endpoint (GET)
         \\
     ;
     std.debug.print("{s}", .{help_text});

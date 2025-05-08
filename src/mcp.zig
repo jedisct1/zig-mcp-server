@@ -37,6 +37,20 @@ pub const Settings = struct {
     port: u16 = 7777,
     /// Array of tools - stored in static memory
     tools: []const Tool = &[_]Tool{},
+    /// Maximum number of concurrent connections (for HTTP transport)
+    max_connections: ?usize = null,
+    /// Number of worker threads (for HTTP transport)
+    /// If null, will use the number of CPU cores
+    thread_count: ?usize = null,
+    /// Connection timeout in milliseconds (for HTTP transport)
+    /// If 0, no timeout is applied
+    connection_timeout_ms: u32 = 30000,
+    /// TCP backlog size for the listening socket (for HTTP transport)
+    backlog_size: ?u32 = null,
+    /// Run HTTP server in non-blocking mode
+    /// This starts a separate thread for accepting connections, allowing
+    /// the main thread to continue execution.
+    non_blocking_http: bool = false,
 };
 
 /// MCP Server state
@@ -81,12 +95,28 @@ pub const Server = struct {
         };
     }
 
+    /// Explicitly request server shutdown
+    /// This will initiate a graceful shutdown process
+    pub fn shutdown(self: *Server) void {
+        if (self.http_server) |*http_server| {
+            http_server.shutdown();
+        }
+        self.state = .shutdown;
+    }
+
     pub fn deinit(self: *Server) void {
-        self.tools.deinit();
-        self.request_context.deinit();
+        // Ensure server is shut down before cleanup
+        if (self.state != .shutdown) {
+            self.shutdown();
+        }
+
+        // Cleanup server resources
         if (self.http_server) |*http_server| {
             http_server.deinit();
         }
+
+        self.tools.deinit();
+        self.request_context.deinit();
     }
 
     pub fn start(self: *Server) !void {
@@ -123,14 +153,24 @@ pub const Server = struct {
     }
 
     fn startHttpTransport(self: *Server) !void {
-        var http_server = try net.HttpServer.init(self.parent_allocator, self.settings.host, self.settings.port);
+        // Initialize the HTTP server with thread pool and connection limiting
+        var http_server = try net.HttpServer.init(self.parent_allocator, self.settings.host, self.settings.port, self.settings.thread_count, // Use the configured thread count or detect CPU cores
+            self.settings.max_connections, // Use the configured max connections or default
+            self.settings.connection_timeout_ms, // Connection timeout in milliseconds
+            self.settings.backlog_size // TCP backlog size
+        );
         self.http_server = http_server;
         self.state = .ready;
 
         // Store server instance for the HTTP handler
         g_server = self;
 
-        try http_server.listen(handleHttpConnection);
+        // Start the HTTP server in non-blocking mode if specified
+        if (self.settings.non_blocking_http) {
+            try http_server.startListening(handleHttpConnection);
+        } else {
+            try http_server.listen(handleHttpConnection);
+        }
     }
 
     fn handleHttpConnection(conn: *net.Connection) !void {
@@ -139,7 +179,15 @@ pub const Server = struct {
         var request = try conn.parseRequest();
         defer request.deinit();
 
-        // Only handle POST requests to /jsonrpc
+        // Health check endpoint
+        if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/health")) {
+            // Simple static health response
+            const health_response = "{\"status\":\"healthy\",\"server\":\"zig-mcp\"}";
+            try conn.sendResponse(200, "application/json", health_response);
+            return;
+        }
+
+        // Only handle POST requests to /jsonrpc for API
         if (!std.mem.eql(u8, request.method, "POST") or !std.mem.eql(u8, request.path, "/jsonrpc")) {
             try conn.sendResponse(404, "text/plain", "Not Found");
             return;

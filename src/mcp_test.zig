@@ -5,6 +5,7 @@ const jsonrpc = @import("jsonrpc.zig");
 
 // Test tool handlers
 fn testEchoHandler(allocator: std.mem.Allocator, params: std.json.Value) !std.json.Value {
+    _ = allocator;
     return params;
 }
 
