@@ -1,6 +1,10 @@
 const std = @import("std");
 const jsonrpc = @import("jsonrpc.zig");
-const net = @import("net.zig");
+const builtin = @import("builtin");
+
+// Only import net.zig when not targeting WebAssembly
+const is_wasm = builtin.cpu.arch.isWasm();
+const net = if (!is_wasm) @import("net.zig") else struct {};
 
 /// MCP Protocol Constants
 pub const PROTOCOL_VERSION = "0.4.0";
@@ -22,13 +26,24 @@ pub const Tool = struct {
 };
 
 /// Transport type
-pub const TransportType = enum {
-    stdio,
-    http,
-};
+pub const TransportType = if (is_wasm)
+    enum {
+        /// When compiling for WebAssembly, only stdio transport is available
+        stdio,
+    }
+else
+    enum {
+        stdio,
+        http,
+    };
 
 /// MCP Server settings
-pub const Settings = struct {
+pub const Settings = if (is_wasm) struct {
+    /// Transport type - only stdio available in WebAssembly
+    transport: TransportType = .stdio,
+    /// Array of tools - stored in static memory
+    tools: []const Tool = &[_]Tool{},
+} else struct {
     /// Transport type
     transport: TransportType = .stdio,
     /// Host for HTTP transport - stored in static memory
@@ -72,8 +87,8 @@ pub const Server = struct {
     state: ServerState,
     /// Map of registered tools
     tools: std.StringHashMap(Tool),
-    /// HTTP server (if using HTTP transport)
-    http_server: ?net.HttpServer,
+    /// HTTP server (if using HTTP transport) - only available on non-WebAssembly targets
+    http_server: if (!is_wasm) ?net.HttpServer else void,
     /// A context arena for the current request-response cycle
     request_context: jsonrpc.Context,
 
@@ -85,21 +100,37 @@ pub const Server = struct {
             try tools.put(tool.name, tool);
         }
 
-        return Server{
-            .parent_allocator = allocator,
-            .settings = settings,
-            .state = .created,
-            .tools = tools,
-            .http_server = null,
-            .request_context = jsonrpc.Context.init(allocator),
-        };
+        if (is_wasm) {
+            // WebAssembly version - no HTTP support
+            return Server{
+                .parent_allocator = allocator,
+                .settings = settings,
+                .state = .created,
+                .tools = tools,
+                .http_server = {}, // void value for WebAssembly
+                .request_context = jsonrpc.Context.init(allocator),
+            };
+        } else {
+            // Native version with HTTP support
+            return Server{
+                .parent_allocator = allocator,
+                .settings = settings,
+                .state = .created,
+                .tools = tools,
+                .http_server = null,
+                .request_context = jsonrpc.Context.init(allocator),
+            };
+        }
     }
 
     /// Explicitly request server shutdown
     /// This will initiate a graceful shutdown process
     pub fn shutdown(self: *Server) void {
-        if (self.http_server) |*http_server| {
-            http_server.shutdown();
+        if (!is_wasm) {
+            // Only try to shutdown HTTP server on non-WebAssembly platforms
+            if (self.http_server) |*http_server| {
+                http_server.shutdown();
+            }
         }
         self.state = .shutdown;
     }
@@ -111,8 +142,11 @@ pub const Server = struct {
         }
 
         // Cleanup server resources
-        if (self.http_server) |*http_server| {
-            http_server.deinit();
+        if (!is_wasm) {
+            // Only try to deinit HTTP server on non-WebAssembly platforms
+            if (self.http_server) |*http_server| {
+                http_server.deinit();
+            }
         }
 
         self.tools.deinit();
@@ -120,9 +154,15 @@ pub const Server = struct {
     }
 
     pub fn start(self: *Server) !void {
-        switch (self.settings.transport) {
-            .stdio => try self.startStdioTransport(),
-            .http => try self.startHttpTransport(),
+        if (is_wasm) {
+            // In WebAssembly, we only support stdio transport
+            try self.startStdioTransport();
+        } else {
+            // On other platforms, both transports are available
+            switch (self.settings.transport) {
+                .stdio => try self.startStdioTransport(),
+                .http => try self.startHttpTransport(),
+            }
         }
     }
 
@@ -153,62 +193,71 @@ pub const Server = struct {
     }
 
     fn startHttpTransport(self: *Server) !void {
-        // Initialize the HTTP server with thread pool and connection limiting
-        var http_server = try net.HttpServer.init(self.parent_allocator, self.settings.host, self.settings.port, self.settings.thread_count, // Use the configured thread count or detect CPU cores
-            self.settings.max_connections, // Use the configured max connections or default
-            self.settings.connection_timeout_ms, // Connection timeout in milliseconds
-            self.settings.backlog_size // TCP backlog size
-        );
-        self.http_server = http_server;
-        self.state = .ready;
-
-        // Store server instance for the HTTP handler
-        g_server = self;
-
-        // Start the HTTP server in non-blocking mode if specified
-        if (self.settings.non_blocking_http) {
-            try http_server.startListening(handleHttpConnection);
+        // HTTP transport is not available in WebAssembly
+        if (is_wasm) {
+            return error.HttpTransportNotAvailableInWebAssembly;
         } else {
-            try http_server.listen(handleHttpConnection);
+            // Initialize the HTTP server with thread pool and connection limiting
+            var http_server = try net.HttpServer.init(self.parent_allocator, self.settings.host, self.settings.port, self.settings.thread_count, // Use the configured thread count or detect CPU cores
+                self.settings.max_connections, // Use the configured max connections or default
+                self.settings.connection_timeout_ms, // Connection timeout in milliseconds
+                self.settings.backlog_size // TCP backlog size
+            );
+            self.http_server = http_server;
+            self.state = .ready;
+
+            // Store server instance for the HTTP handler
+            g_server = self;
+
+            // Start the HTTP server in non-blocking mode if specified
+            if (self.settings.non_blocking_http) {
+                try http_server.startListening(handleHttpConnection);
+            } else {
+                try http_server.listen(handleHttpConnection);
+            }
         }
     }
 
+    // HTTP connection handler functions are only available on non-WebAssembly platforms
     fn handleHttpConnection(conn: *net.Connection) !void {
-        defer conn.deinit();
+        if (is_wasm) {
+            return error.HttpHandlerNotAvailableInWebAssembly;
+        } else {
+            defer conn.deinit();
 
-        var request = try conn.parseRequest();
-        defer request.deinit();
+            var request = try conn.parseRequest();
+            defer request.deinit();
 
-        // Health check endpoint
-        if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/health")) {
-            // Simple static health response
-            const health_response = "{\"status\":\"healthy\",\"server\":\"zig-mcp\"}";
-            try conn.sendResponse(200, "application/json", health_response);
-            return;
+            // Health check endpoint
+            if (std.mem.eql(u8, request.method, "GET") and std.mem.eql(u8, request.path, "/health")) {
+                // Simple static health response
+                const health_response = "{\"status\":\"healthy\",\"server\":\"zig-mcp\"}";
+                try conn.sendResponse(200, "application/json", health_response);
+                return;
+            }
+
+            // Only handle POST requests to /jsonrpc for API
+            if (!std.mem.eql(u8, request.method, "POST") or !std.mem.eql(u8, request.path, "/jsonrpc")) {
+                try conn.sendResponse(404, "text/plain", "Not Found");
+                return;
+            }
+
+            // Get server instance from the global pointer
+            const server = g_server;
+
+            // Process the JSON-RPC request
+            const response = try server.handleRequest(request.body);
+
+            // Send the response
+            try conn.sendResponse(200, "application/json", response);
+
+            // Reset the request context for the next request
+            server.request_context.reset();
         }
-
-        // Only handle POST requests to /jsonrpc for API
-        if (!std.mem.eql(u8, request.method, "POST") or !std.mem.eql(u8, request.path, "/jsonrpc")) {
-            try conn.sendResponse(404, "text/plain", "Not Found");
-            return;
-        }
-
-        // Get server instance from the global pointer
-        const server = g_server;
-
-        // Process the JSON-RPC request
-        const response = try server.handleRequest(request.body);
-
-        // Send the response
-        try conn.sendResponse(200, "application/json", response);
-
-        // Reset the request context for the next request
-        server.request_context.reset();
     }
 
-    // Global server pointer for the HTTP handler
-    // This is a simplification for this example
-    var g_server: *Server = undefined;
+    // Global server pointer for the HTTP handler - only used in non-WebAssembly platforms
+    var g_server: if (!is_wasm) *Server else void = if (!is_wasm) undefined else {};
 
     pub fn handleRequest(self: *Server, request_str: []const u8) ![]const u8 {
         // Parse the JSON-RPC request

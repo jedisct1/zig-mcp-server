@@ -12,7 +12,7 @@ The Zig MCP Server is a memory-efficient implementation of the [Model Context Pr
 
 ## Features
 
-- **Enhanced HTTP Server**:
+- **Built-in HTTP Server**:
   - Threaded connection handling with configurable thread pool
   - Connection limiting to prevent resource exhaustion
   - Graceful shutdown support
@@ -196,7 +196,13 @@ The server can be compiled to WebAssembly for deployment in serverless environme
 zig build -Dtarget=wasm32-wasi -Doptimize=ReleaseSmall
 ```
 
-This allows you to run the MCP server in WASI-compatible serverless environments.
+When compiled for WebAssembly, the following restrictions apply:
+
+1. **Stdio Transport Only**: The HTTP transport is automatically disabled in WebAssembly builds
+2. **Command-line Options**: Most command-line options are unavailable (only `--help` works)
+3. **Simplified API**: The API is automatically simplified to only include stdio-related fields
+
+This makes the WebAssembly binary smaller and more focused for running in WebAssembly environments like Fastly Compute or other WASI-compatible serverless platforms where HTTP handling is typically provided by the host environment.
 
 ## Library Integration
 

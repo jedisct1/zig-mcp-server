@@ -1,7 +1,11 @@
 const std = @import("std");
-const net = @import("net.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const mcp = @import("mcp.zig");
+const builtin = @import("builtin");
+
+// Only import net.zig when not targeting WebAssembly
+const is_wasm = builtin.cpu.arch.isWasm();
+const net = if (!is_wasm) @import("net.zig") else struct {};
 
 pub fn main() !void {
     // Initialize allocator
@@ -35,17 +39,26 @@ pub fn main() !void {
         },
     };
 
-    var settings = mcp.Settings{
-        .port = 7777,
-        .host = "127.0.0.1",
-        .transport = .stdio,
-        .tools = &tools,
-        .max_connections = 1000, // Default to 1000 max connections
-        .thread_count = null, // Default to auto-detect (based on CPU cores)
-        .connection_timeout_ms = 30000, // Default to 30 seconds timeout
-        .backlog_size = 128, // Default to 128 connections backlog
-        .non_blocking_http = false, // Default to blocking HTTP server
-    };
+    // Configure settings based on platform
+    var settings = if (is_wasm)
+        // In WebAssembly, only stdio transport is available with limited settings
+        mcp.Settings{
+            .transport = .stdio,
+            .tools = &tools,
+        }
+    else
+        // On native platforms, all settings are available
+        mcp.Settings{
+            .port = 7777,
+            .host = "127.0.0.1",
+            .transport = .stdio,
+            .tools = &tools,
+            .max_connections = 1000, // Default to 1000 max connections
+            .thread_count = null, // Default to auto-detect (based on CPU cores)
+            .connection_timeout_ms = 30000, // Default to 30 seconds timeout
+            .backlog_size = 128, // Default to 128 connections backlog
+            .non_blocking_http = false, // Default to blocking HTTP server
+        };
 
     // Parse command line arguments using stack-allocated buffer
     var arg_buf: [256]u8 = undefined;
@@ -65,7 +78,10 @@ pub fn main() !void {
                 }
             }
         } else if (std.mem.eql(u8, arg, "--transport") or std.mem.eql(u8, arg, "-t")) {
-            if (args_it.next()) |transport| {
+            if (is_wasm) {
+                // For WebAssembly, only stdio transport is allowed
+                std.debug.print("WebAssembly build only supports stdio transport\n", .{});
+            } else if (args_it.next()) |transport| {
                 if (std.mem.eql(u8, transport, "stdio")) {
                     settings.transport = .stdio;
                 } else if (std.mem.eql(u8, transport, "http")) {
@@ -75,23 +91,44 @@ pub fn main() !void {
                 }
             }
         } else if (std.mem.eql(u8, arg, "--threads") or std.mem.eql(u8, arg, "-j")) {
-            if (args_it.next()) |threads_str| {
+            if (is_wasm) {
+                // Skip HTTP-specific arguments on WebAssembly
+                std.debug.print("--threads option not available in WebAssembly build\n", .{});
+                _ = args_it.next(); // Skip the value
+            } else if (args_it.next()) |threads_str| {
                 settings.thread_count = try std.fmt.parseInt(usize, threads_str, 10);
             }
         } else if (std.mem.eql(u8, arg, "--max-connections") or std.mem.eql(u8, arg, "-c")) {
-            if (args_it.next()) |conn_str| {
+            if (is_wasm) {
+                // Skip HTTP-specific arguments on WebAssembly
+                std.debug.print("--max-connections option not available in WebAssembly build\n", .{});
+                _ = args_it.next(); // Skip the value
+            } else if (args_it.next()) |conn_str| {
                 settings.max_connections = try std.fmt.parseInt(usize, conn_str, 10);
             }
         } else if (std.mem.eql(u8, arg, "--timeout") or std.mem.eql(u8, arg, "-T")) {
-            if (args_it.next()) |timeout_str| {
+            if (is_wasm) {
+                // Skip HTTP-specific arguments on WebAssembly
+                std.debug.print("--timeout option not available in WebAssembly build\n", .{});
+                _ = args_it.next(); // Skip the value
+            } else if (args_it.next()) |timeout_str| {
                 settings.connection_timeout_ms = try std.fmt.parseInt(u32, timeout_str, 10);
             }
         } else if (std.mem.eql(u8, arg, "--backlog") or std.mem.eql(u8, arg, "-b")) {
-            if (args_it.next()) |backlog_str| {
+            if (is_wasm) {
+                // Skip HTTP-specific arguments on WebAssembly
+                std.debug.print("--backlog option not available in WebAssembly build\n", .{});
+                _ = args_it.next(); // Skip the value
+            } else if (args_it.next()) |backlog_str| {
                 settings.backlog_size = try std.fmt.parseInt(u32, backlog_str, 10);
             }
         } else if (std.mem.eql(u8, arg, "--non-blocking")) {
-            settings.non_blocking_http = true;
+            if (is_wasm) {
+                // Skip HTTP-specific arguments on WebAssembly
+                std.debug.print("--non-blocking option not available in WebAssembly build\n", .{});
+            } else {
+                settings.non_blocking_http = true;
+            }
         } else if (std.mem.eql(u8, arg, "--help")) {
             printHelp();
             return;
@@ -103,7 +140,9 @@ pub fn main() !void {
     defer server.deinit();
 
     std.debug.print("MCP Server starting with transport: {s}\n", .{@tagName(settings.transport)});
-    if (settings.transport == .http) {
+
+    // HTTP-specific output is only available on non-WebAssembly platforms
+    if (!is_wasm and settings.transport == .http) {
         const thread_count_str = if (settings.thread_count) |tc|
             std.fmt.allocPrint(allocator, "{d}", .{tc}) catch "(error)"
         else
@@ -124,33 +163,50 @@ pub fn main() !void {
         }
 
         std.debug.print("Listening on http://{s}:{d} with {s} threads, {d} max connections, timeout: {s}\n", .{ settings.host, settings.port, thread_count_str, max_connections, timeout_str });
+    } else if (is_wasm) {
+        std.debug.print("Running in WebAssembly mode (stdio transport only)\n", .{});
     }
 
     try server.start();
 }
 
 fn printHelp() void {
-    // Use comptime string for help text
-    const help_text =
-        \\Usage: zig-mcp [options]
-        \\
-        \\Options:
-        \\  --port, -p <port>                  Port to listen on (default: 7777)
-        \\  --host, -h <host>                  Host to bind to (default: 127.0.0.1)
-        \\  --transport, -t <transport>        Transport to use (stdio, http) (default: stdio)
-        \\  --threads, -j <count>              Number of worker threads (default: CPU core count)
-        \\  --max-connections, -c <count>      Maximum concurrent connections (default: 1000)
-        \\  --timeout, -T <milliseconds>       Connection timeout in milliseconds (default: 30000, 0 = no timeout)
-        \\  --backlog, -b <count>              TCP connection backlog size (default: 128)
-        \\  --non-blocking                     Run HTTP server in non-blocking mode
-        \\  --help                             Print this help message
-        \\
-        \\Server Endpoints:
-        \\  /jsonrpc                           Main JSON-RPC endpoint (POST)
-        \\  /health                            Health check endpoint (GET)
-        \\
-    ;
-    std.debug.print("{s}", .{help_text});
+    // Use different help text based on platform
+    if (is_wasm) {
+        // WebAssembly-specific help text
+        const wasm_help_text =
+            \\Usage: zig-mcp [options]
+            \\
+            \\WebAssembly Version - Only stdio transport is available
+            \\
+            \\Options:
+            \\  --help                             Print this help message
+            \\
+        ;
+        std.debug.print("{s}", .{wasm_help_text});
+    } else {
+        // Full help text for native platforms
+        const help_text =
+            \\Usage: zig-mcp [options]
+            \\
+            \\Options:
+            \\  --port, -p <port>                  Port to listen on (default: 7777)
+            \\  --host, -h <host>                  Host to bind to (default: 127.0.0.1)
+            \\  --transport, -t <transport>        Transport to use (stdio, http) (default: stdio)
+            \\  --threads, -j <count>              Number of worker threads (default: CPU core count)
+            \\  --max-connections, -c <count>      Maximum concurrent connections (default: 1000)
+            \\  --timeout, -T <milliseconds>       Connection timeout in milliseconds (default: 30000, 0 = no timeout)
+            \\  --backlog, -b <count>              TCP connection backlog size (default: 128)
+            \\  --non-blocking                     Run HTTP server in non-blocking mode
+            \\  --help                             Print this help message
+            \\
+            \\Server Endpoints:
+            \\  /jsonrpc                           Main JSON-RPC endpoint (POST)
+            \\  /health                            Health check endpoint (GET)
+            \\
+        ;
+        std.debug.print("{s}", .{help_text});
+    }
 }
 
 // Tool handler implementations
