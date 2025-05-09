@@ -1,9 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Detect WebAssembly target
+const is_wasm = builtin.cpu.arch.isWasm();
 
 /// Re-export MCP modules
 pub const mcp = @import("mcp.zig");
 pub const jsonrpc = @import("jsonrpc.zig");
-pub const net = @import("net.zig");
+// Only export net.zig on non-WebAssembly targets
+pub const net = if (!is_wasm) @import("net.zig") else struct {};
 pub const tool_handlers = @import("tools.zig");
 
 /// Version of the zig-mcp library
@@ -17,14 +22,23 @@ pub fn createServer(
     host: []const u8,
     port: u16,
 ) !mcp.Server {
-    const settings = mcp.Settings{
-        .transport = transport_type,
-        .host = host,
-        .port = port,
-        .tools = tool_list,
-    };
-
-    return try mcp.Server.init(allocator, settings);
+    if (is_wasm) {
+        // In WebAssembly, we only use stdio transport and ignore host/port
+        const settings = mcp.Settings{
+            .transport = .stdio, // Force stdio for WebAssembly
+            .tools = tool_list,
+        };
+        return try mcp.Server.init(allocator, settings);
+    } else {
+        // For non-WebAssembly platforms, use all parameters
+        const settings = mcp.Settings{
+            .transport = transport_type,
+            .host = host,
+            .port = port,
+            .tools = tool_list,
+        };
+        return try mcp.Server.init(allocator, settings);
+    }
 }
 
 /// Create a tool definition with the given name, description and handler
@@ -46,7 +60,10 @@ test "main export test" {
     // This test imports and exercises all exported items
     _ = mcp;
     _ = jsonrpc;
-    _ = net;
+    if (!is_wasm) {
+        // Net module only available on non-WebAssembly platforms
+        _ = net;
+    }
     _ = tool_handlers;
     _ = VERSION;
     _ = createServer;

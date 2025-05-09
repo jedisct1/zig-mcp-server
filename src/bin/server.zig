@@ -1,7 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mcp_lib = @import("zig-mcp");
 const mcp = mcp_lib.mcp;
 const jsonrpc = mcp_lib.jsonrpc;
+
+// Detect WebAssembly target
+const is_wasm = builtin.cpu.arch.isWasm();
 
 pub fn main() !void {
     // Initialize allocator
@@ -35,7 +39,12 @@ pub fn main() !void {
         },
     };
 
-    var settings = mcp.Settings{
+    var settings = if (is_wasm) mcp.Settings{
+        // WebAssembly version - only stdio transport is available
+        .transport = .stdio,
+        .tools = &tools,
+    } else mcp.Settings{
+        // Native version with all options
         .port = 7777,
         .host = "127.0.0.1",
         .transport = .stdio,
@@ -48,45 +57,72 @@ pub fn main() !void {
     // Parse command line arguments using stack-allocated buffer
     var arg_buf: [256]u8 = undefined;
     while (args_it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
-            if (args_it.next()) |port_str| {
-                settings.port = try std.fmt.parseInt(u16, port_str, 10);
-            }
-        } else if (std.mem.eql(u8, arg, "--host") or std.mem.eql(u8, arg, "-h")) {
-            if (args_it.next()) |host| {
-                // Copy host to static buffer
-                if (host.len < arg_buf.len) {
-                    @memcpy(arg_buf[0..host.len], host);
-                    settings.host = arg_buf[0..host.len];
-                } else {
-                    std.debug.print("Host name too long, using default\n", .{});
+        if (is_wasm) {
+            // In WebAssembly mode, only --help is supported
+            if (std.mem.eql(u8, arg, "--help")) {
+                printHelp();
+                return;
+            } else {
+                std.debug.print("Ignoring unsupported option '{s}' in WebAssembly mode\n", .{arg});
+                // Skip the value if it's a key-value parameter
+                if (std.mem.eql(u8, arg, "--port") or
+                    std.mem.eql(u8, arg, "-p") or
+                    std.mem.eql(u8, arg, "--host") or
+                    std.mem.eql(u8, arg, "-h") or
+                    std.mem.eql(u8, arg, "--transport") or
+                    std.mem.eql(u8, arg, "-t") or
+                    std.mem.eql(u8, arg, "--threads") or
+                    std.mem.eql(u8, arg, "-j") or
+                    std.mem.eql(u8, arg, "--max-connections") or
+                    std.mem.eql(u8, arg, "-c") or
+                    std.mem.eql(u8, arg, "--timeout") or
+                    std.mem.eql(u8, arg, "-T"))
+                {
+                    _ = args_it.next();
                 }
             }
-        } else if (std.mem.eql(u8, arg, "--transport") or std.mem.eql(u8, arg, "-t")) {
-            if (args_it.next()) |transport| {
-                if (std.mem.eql(u8, transport, "stdio")) {
-                    settings.transport = .stdio;
-                } else if (std.mem.eql(u8, transport, "http")) {
-                    settings.transport = .http;
-                } else {
-                    std.debug.print("Unknown transport: {s}. Using default.\n", .{transport});
+        } else {
+            // Full command-line parsing for native platforms
+            if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
+                if (args_it.next()) |port_str| {
+                    settings.port = try std.fmt.parseInt(u16, port_str, 10);
                 }
+            } else if (std.mem.eql(u8, arg, "--host") or std.mem.eql(u8, arg, "-h")) {
+                if (args_it.next()) |host| {
+                    // Copy host to static buffer
+                    if (host.len < arg_buf.len) {
+                        @memcpy(arg_buf[0..host.len], host);
+                        settings.host = arg_buf[0..host.len];
+                    } else {
+                        std.debug.print("Host name too long, using default\n", .{});
+                    }
+                }
+            } else if (std.mem.eql(u8, arg, "--transport") or std.mem.eql(u8, arg, "-t")) {
+                if (args_it.next()) |transport| {
+                    if (std.mem.eql(u8, transport, "stdio")) {
+                        settings.transport = .stdio;
+                    } else if (std.mem.eql(u8, transport, "http")) {
+                        settings.transport = .http;
+                    } else {
+                        std.debug.print("Unknown transport: {s}. Using default.\n", .{transport});
+                    }
+                }
+            } else if (std.mem.eql(u8, arg, "--threads") or std.mem.eql(u8, arg, "-j")) {
+                if (args_it.next()) |threads_str| {
+                    settings.thread_count = try std.fmt.parseInt(usize, threads_str, 10);
+                }
+            } else if (std.mem.eql(u8, arg, "--max-connections") or std.mem.eql(u8, arg, "-c")) {
+                if (args_it.next()) |conn_str| {
+                    settings.max_connections = try std.fmt.parseInt(usize, conn_str, 10);
+                }
+            } else if (std.mem.eql(u8, arg, "--timeout") or std.mem.eql(u8, arg, "-T")) {
+                if (args_it.next()) |timeout_str| {
+                    settings.connection_timeout_ms = try std.fmt.parseInt(u32, timeout_str, 10);
+                }
+            } else if (std.mem.eql(u8, arg, "--help")) {
+                printHelp();
+                return;
             }
-        } else if (std.mem.eql(u8, arg, "--threads") or std.mem.eql(u8, arg, "-j")) {
-            if (args_it.next()) |threads_str| {
-                settings.thread_count = try std.fmt.parseInt(usize, threads_str, 10);
-            }
-        } else if (std.mem.eql(u8, arg, "--max-connections") or std.mem.eql(u8, arg, "-c")) {
-            if (args_it.next()) |conn_str| {
-                settings.max_connections = try std.fmt.parseInt(usize, conn_str, 10);
-            }
-        } else if (std.mem.eql(u8, arg, "--timeout") or std.mem.eql(u8, arg, "-T")) {
-            if (args_it.next()) |timeout_str| {
-                settings.connection_timeout_ms = try std.fmt.parseInt(u32, timeout_str, 10);
-            }
-        } else if (std.mem.eql(u8, arg, "--help")) {
-            printHelp();
-            return;
         }
     }
 
@@ -95,7 +131,12 @@ pub fn main() !void {
     defer server.deinit();
 
     std.debug.print("MCP Server starting with transport: {s}\n", .{@tagName(settings.transport)});
-    if (settings.transport == .http) {
+
+    if (is_wasm) {
+        // WebAssembly-specific output
+        std.debug.print("Running in WebAssembly mode with stdio transport\n", .{});
+    } else if (settings.transport == .http) {
+        // HTTP-specific output for native platforms
         const thread_count_str = if (settings.thread_count) |tc|
             std.fmt.allocPrint(allocator, "{d}", .{tc}) catch "(error)"
         else
@@ -122,21 +163,37 @@ pub fn main() !void {
 }
 
 fn printHelp() void {
-    // Use comptime string for help text
-    const help_text =
-        \\Usage: zig-mcp [options]
-        \\
-        \\Options:
-        \\  --port, -p <port>                  Port to listen on (default: 7777)
-        \\  --host, -h <host>                  Host to bind to (default: 127.0.0.1)
-        \\  --transport, -t <transport>        Transport to use (stdio, http) (default: stdio)
-        \\  --threads, -j <count>              Number of worker threads (default: CPU core count)
-        \\  --max-connections, -c <count>      Maximum concurrent connections (default: 1000)
-        \\  --timeout, -T <milliseconds>       Connection timeout in milliseconds (default: 30000, 0 = no timeout)
-        \\  --help                             Print this help message
-        \\
-    ;
-    std.debug.print("{s}", .{help_text});
+    if (is_wasm) {
+        // WebAssembly-specific help text
+        const wasm_help_text =
+            \\Usage: zig-mcp [options]
+            \\
+            \\WebAssembly Version - Only stdio transport is available
+            \\
+            \\Options:
+            \\  --help                             Print this help message
+            \\
+        ;
+        std.debug.print("{s}", .{wasm_help_text});
+    } else {
+        // Full help text for native platforms
+        const help_text =
+            \\Usage: zig-mcp [options]
+            \\
+            \\Options:
+            \\  --port, -p <port>                  Port to listen on (default: 7777)
+            \\  --host, -h <host>                  Host to bind to (default: 127.0.0.1)
+            \\  --transport, -t <transport>        Transport to use (stdio, http) (default: stdio)
+            \\  --threads, -j <count>              Number of worker threads (default: CPU core count)
+            \\  --max-connections, -c <count>      Maximum concurrent connections (default: 1000)
+            \\  --timeout, -T <milliseconds>       Connection timeout in milliseconds (default: 30000, 0 = no timeout)
+            \\  --help                             Print this help message
+            \\
+            \\When compiled for WebAssembly, only stdio transport is available.
+            \\
+        ;
+        std.debug.print("{s}", .{help_text});
+    }
 }
 
 // Tool handler implementations
