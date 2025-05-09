@@ -223,7 +223,13 @@ pub const Server = struct {
         if (is_wasm) {
             return error.HttpHandlerNotAvailableInWebAssembly;
         } else {
-            defer conn.deinit();
+            // Use errdefer to ensure conn is closed only on error paths
+            // The normal path will close when the connectionJob is cleaned up
+            errdefer {
+                if (!conn.is_closed) {
+                    conn.deinit();
+                }
+            }
 
             var request = try conn.parseRequest();
             defer request.deinit();

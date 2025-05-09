@@ -327,6 +327,8 @@ pub const HttpServer = struct {
             // Check shutdown flag again after potentially long accept call
             if (self.shutdown_requested.load(Ordering.monotonic) or self.server_closed) {
                 std.debug.print("Shutdown detected after accept, closing connection\n", .{});
+                // Close the socket safely without trying to use the connection struct
+                // This avoids any double-close issues during shutdown
                 conn.stream.close();
                 break;
             }
@@ -356,6 +358,7 @@ pub const HttpServer = struct {
                 .timeout_ms = self.connection_timeout_ms,
                 .created_at = std.time.milliTimestamp(),
                 .server_metrics = &self.metrics,
+                .is_closed = false, // Explicitly mark as not closed
             };
 
             // Create a job for the connection
@@ -426,6 +429,7 @@ pub const HttpServer = struct {
                 .timeout_ms = self.connection_timeout_ms,
                 .created_at = std.time.milliTimestamp(),
                 .server_metrics = &self.metrics,
+                .is_closed = false, // Explicitly mark as not closed
             };
 
             // Create a job for the connection
@@ -464,13 +468,20 @@ pub const Connection = struct {
     created_at: i64,
     /// Reference to server metrics for tracking
     server_metrics: ?*ServerMetrics = null,
+    /// Whether this connection has already been closed
+    is_closed: bool = false,
 
     pub fn deinit(self: *Connection) void {
         // When connection is closed, update metrics for completed request
         if (self.server_metrics) |metrics| {
             _ = metrics.total_requests.fetchAdd(1, Ordering.monotonic);
         }
-        self.stream.close();
+
+        // Only close the stream if it hasn't been closed already
+        if (!self.is_closed) {
+            self.stream.close();
+            self.is_closed = true;
+        }
     }
 
     /// Returns whether the connection has timed out
@@ -497,9 +508,23 @@ pub const Connection = struct {
             return error.ConnectionTimedOut;
         }
 
+        // Check if connection is already closed
+        if (self.is_closed) {
+            return error.ConnectionClosed;
+        }
+
         // For simplicity, we're relying on the global timeout mechanism
         // The OS will typically have its own timeout mechanisms for inactive connections
-        const bytes_read = try self.stream.read(buffer);
+        const bytes_read = self.stream.read(buffer) catch |err| {
+            // If we get a broken pipe or connection reset, mark as closed
+            switch (err) {
+                error.BrokenPipe, error.ConnectionResetByPeer => {
+                    self.is_closed = true;
+                    return err;
+                },
+                else => return err,
+            }
+        };
 
         // Record bytes received in metrics
         if (self.server_metrics) |metrics| {
@@ -515,9 +540,23 @@ pub const Connection = struct {
             return error.ConnectionTimedOut;
         }
 
+        // Check if connection is already closed
+        if (self.is_closed) {
+            return error.ConnectionClosed;
+        }
+
         // For simplicity, we're relying on the global timeout mechanism
         // The OS will typically have its own timeout mechanisms for inactive connections
-        const bytes_written = try self.stream.write(buffer);
+        const bytes_written = self.stream.write(buffer) catch |err| {
+            // If we get a broken pipe or connection reset, mark as closed
+            switch (err) {
+                error.BrokenPipe, error.ConnectionResetByPeer => {
+                    self.is_closed = true;
+                    return err;
+                },
+                else => return err,
+            }
+        };
 
         // Record bytes sent in metrics
         if (self.server_metrics) |metrics| {
@@ -531,6 +570,11 @@ pub const Connection = struct {
         // Check if connection has timed out
         if (self.hasTimedOut()) {
             return error.ConnectionTimedOut;
+        }
+
+        // Check if connection is already closed
+        if (self.is_closed) {
+            return error.ConnectionClosed;
         }
 
         var remaining = buffer;
@@ -899,13 +943,15 @@ pub const ConnectionJob = struct {
         const ptr = @as([*]u8, @ptrCast(job_ptr)) - offset;
         const self = @as(*ConnectionJob, @ptrCast(@alignCast(ptr)));
 
-        // Execute the handler
+        // Execute the handler - this will close the connection on error
         self.handler(self.connection) catch |err| {
             std.debug.print("Error in connection handler: {}\n", .{err});
         };
 
-        // Cleanup
-        self.connection.deinit();
+        // Cleanup - make sure we don't double-close
+        if (!self.connection.is_closed) {
+            self.connection.deinit();
+        }
         self.allocator.destroy(self.connection);
         self.allocator.destroy(self);
     }

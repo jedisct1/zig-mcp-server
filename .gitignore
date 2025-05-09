@@ -15,3 +15,5 @@ zig-out/
 Thumbs.db
 
 
+
+**/.claude/settings.local.json
